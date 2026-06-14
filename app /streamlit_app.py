@@ -9,6 +9,15 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 
+import hashlib
+import shutil
+from pathlib import Path
+import time
+
+CACHE_DIR = Path("cached_vectorstores")
+CACHE_DIR.mkdir(exist_ok=True)
+
+
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
@@ -49,6 +58,82 @@ def get_llm():
         google_api_key=GOOGLE_API_KEY,
     )
 
+def get_file_hash(uploaded_file):
+    uploaded_file.seek(0)
+    file_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+    return hashlib.md5(file_bytes).hexdigest()
+
+def get_embeddings():
+    return GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        google_api_key=GOOGLE_API_KEY,
+    )
+
+def get_or_create_vectorstore(uploaded_file, chunk_size=5000, chunk_overlap=200):
+    file_hash = get_file_hash(uploaded_file)
+    persist_directory = CACHE_DIR / file_hash
+    temp_directory = CACHE_DIR / f"{file_hash}.tmp"
+
+    embeddings = get_embeddings()
+
+    if persist_directory.exists() and any(persist_directory.iterdir()):
+        st.info("Using cached vector database. No re-embedding needed.")
+        return Chroma(
+            persist_directory=str(persist_directory),
+            embedding_function=embeddings,
+        )
+
+    st.info("Creating vector database for this PDF. This may take a moment.")
+
+    shutil.rmtree(temp_directory, ignore_errors=True)
+    shutil.rmtree(persist_directory, ignore_errors=True)
+
+    temp_path = save_uploaded_pdf(uploaded_file)
+    documents = load_pdf_documents(temp_path)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    chunks = splitter.split_documents(documents)
+    st.write(f"Created {len(chunks)} chunks")
+
+    try:
+        vectorstore = Chroma(
+            persist_directory=str(temp_directory),
+            embedding_function=embeddings,
+        )
+
+        batch_size = 10
+
+        for start in range(0, len(chunks), batch_size):
+            end = start + batch_size
+            batch = chunks[start:end]
+
+            st.write(f"Embedding chunks {start + 1}–{min(end, len(chunks))} of {len(chunks)}")
+
+            vectorstore.add_documents(batch)
+
+            # Avoid Gemini free-tier per-minute embedding limit
+            if end < len(chunks):
+                time.sleep(15)
+
+        temp_directory.rename(persist_directory)
+
+        return Chroma(
+            persist_directory=str(persist_directory),
+            embedding_function=embeddings,
+        )
+
+    except Exception as e:
+        shutil.rmtree(temp_directory, ignore_errors=True)
+        shutil.rmtree(persist_directory, ignore_errors=True)
+        st.error("Embedding failed. Cache was deleted so it will not be reused incorrectly.")
+        raise e
+
+
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
@@ -65,31 +150,13 @@ with tab1:
 
     if uploaded_file and question: 
         with st.spinner("Reading PDF and searching for relative context..."):
-            temp_path = save_uploaded_pdf(uploaded_file)
-            documents = load_pdf_documents(temp_path)
-
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-            )
-
-            chunks = splitter.split_documents(documents)
-
-            embeddings = GoogleGenerativeAIEmbeddings(
-                model="gemini-embedding-001",
-                google_api_key=GOOGLE_API_KEY,
-            )
-
-            vectorstore = Chroma.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-            )
+            vectorstore = get_or_create_vectorstore(uploaded_file)
 
             retriever = vectorstore.as_retriever(
                 search_type="mmr",
                 search_kwargs={
-                    "k": 8,
-                    "fetch_k": 40
+                    "k": 6,
+                    "fetch_k": 30,
                 },
             )
 
